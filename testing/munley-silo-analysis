@@ -1,0 +1,339 @@
+ ---                                                                                                                                 
+  name: munley-silo-analyzer                                                                                                          
+  description: Analyze a group of Munley Law pages for duplicate content, legal errors, copy mistakes, structural issues, and CTA     
+  problems. Produces a structured per-page audit report. Use when user wants to audit a Munley Law silo, check for duplicate content, 
+  find mistakes, or get a content refresh report.
+  tools: Bash                                                                                                                         
+  ---                                                                                                                                 
+                                                                                                                                      
+  # Munley Law Silo Analyzer                                                                                                          
+                  
+  Analyzes a set of Munley Law pages for content quality issues: shared copy, structural problems, legal/factual errors, and copy
+  mistakes.                               
+
+  **Critical rule: Never modify any page. This is a read-only audit.**                                                                
+                                          
+  ---                                                                                                                                 
+                                                                                                                                      
+  ## Step 0 — Load Patterns Log               
+                                                                                                                                      
+  Before doing anything else, read the patterns log:
+                                                                                                                                      
+  ```
+  /Users/nicko/.claude/skills/munley-silo-analyzer/PATTERNS.md                                                                        
+  ```             
+                                                                                                                                      
+  If the file exists, scan the **Cross-Funnel Patterns** section. Note any confirmed patterns (marked `[CONFIRMED]`) so you can flag
+  recurrences during this run. If the file doesn't exist, proceed silently.
+
+  ---                                                                                                                                 
+   
+  ## Preconditions                                                                                                                    
+                                          
+  The user must provide a list of URLs to analyze. If they haven't, ask for them before starting.
+                                                                                                                                      
+  Identify one page as the **parent** (top of the silo — usually the broadest or highest in the site hierarchy). The rest are
+  **supporting pages**. If the user hasn't specified which is the parent, infer it from the URL structure (shortest path = parent) and
+   confirm before proceeding.
+                                                                                                                                      
+  ---             
+                                                                                                                                      
+  ## Step 1 — Extract Content from Each Page
+
+  Use Playwright to navigate to each URL and extract the main body content.
+                                          
+  **1a. Find the content container.**         
+                                                                                                                                      
+  ```javascript
+  () => {                                                                                                                             
+    const selectors = [
+      '#pageContentContainer', '.entry-content', '.post-content',                                                                     
+      'article', 'main', '#main-content', '.content', '#content'
+    ];                                        
+    return selectors.map(sel => {         
+      const el = document.querySelector(sel);                                                                                         
+      return { sel, found: !!el, textLength: el ? el.innerText.trim().length : 0 };                                                   
+    });                                                                                                                               
+  }                                                                                                                                   
+  ```             
+                                                                                                                                      
+  Pick the selector with the most text that is clearly the main content (not nav/footer/sidebar).
+                                                                                                                                      
+  **1b. Extract text and metadata.**          
+                                                                                                                                      
+  ```javascript
+  () => {                                                                                                                             
+    const container = document.querySelector('#pageContentContainer') || document.querySelector('main') || document.body;
+    const headings = Array.from(document.querySelectorAll('h1, h2, h3')).map(h => ({                                                  
+      level: h.tagName, text: h.innerText.trim()
+    }));                                  
+    return {                                                                                                                          
+      url: window.location.href,                                                                                                      
+      title: document.title,                                                                                                          
+      headings,                                                                                                                       
+      text: container.innerText.trim().replace(/\s+/g, ' ')
+    };                                                                                                                                
+  }                                       
+  ```                                                                                                                                 
+                                                                                                                                      
+  **1c. Extract and test hyperlinks from body copy.**
+                                                                                                                                      
+  After extracting text, fetch the raw HTML and extract all `<a href>` elements from the main content container (excluding nav,
+  header, footer, sidebar). For each link record the anchor text, href, and whether it is internal (munley.com) or external. Skip     
+  `mailto:`, `tel:`, and anchor (`#`) links — these are not testable URLs.
+                                                                                                                                      
+  ```python       
+  from bs4 import BeautifulSoup                                                                                                       
+  import urllib.request                       
+                                          
+  # Load saved HTML, strip nav/header/footer/sidebar/script/style
+  # container = #pageContentContainer or main or body                                                                                 
+  # links = [(a.get_text(strip=True), a['href']) for a in container.find_all('a', href=True)
+  #           if a.get_text(strip=True) and not a['href'].startswith(('mailto:', 'tel:', '#'))]                                       
+  ```                                         
+                                                                                                                                      
+  **Test every link with a HEAD request** (fall back to GET if HEAD is refused). Use a 10-second timeout. Record the HTTP status code 
+  for each URL. Classify as:                                                                                                          
+                                                                                                                                      
+  - **Broken** — 4xx or 5xx response (flag in report)                                                                                 
+  - **Redirect** — 3xx response; note the final destination if it differs significantly from the original href (e.g., redirects to
+  homepage = likely broken)                                                                                                           
+  - **OK** — 200 response                                                                                                             
+   
+  ```python                                                                                                                           
+  import urllib.request, urllib.error     
+                                                                                                                                      
+  def check_link(url, timeout=10):                                                                                                    
+      req = urllib.request.Request(url, method='HEAD',
+            headers={'User-Agent': 'Mozilla/5.0'})                                                                                    
+      try:                                
+          resp = urllib.request.urlopen(req, timeout=timeout)
+          return resp.status, resp.url                                                                                                
+      except urllib.error.HTTPError as e: 
+          if e.code == 405:  # HEAD not allowed, try GET                                                                              
+              req2 = urllib.request.Request(url,                                                                                      
+                     headers={'User-Agent': 'Mozilla/5.0'})
+              try:                                                                                                                    
+                  resp2 = urllib.request.urlopen(req2, timeout=timeout)                                                               
+                  return resp2.status, resp2.url
+              except urllib.error.HTTPError as e2:                                                                                    
+                  return e2.code, url         
+          return e.code, url                                                                                                          
+      except Exception as ex:
+          return str(ex), url                                                                                                         
+  ```
+                                                                                                                                      
+  After testing, flag the following during analysis:
+  - **Broken links** — any link returning 4xx or 5xx, or a 3xx that resolves to the site homepage
+  - **Attorney bio blocks with no link** — bio block names an attorney but does not hyperlink to their `/our-attorneys/[name]/` page
+  - **Weak anchor text on internal links** — anchor text is generic ("click here", "learn more", "here", or a bare URL)               
+  - **Mismatched internal links** — internal link goes to a different practice area than the page topic when a more relevant page
+  exists                                                                                                                              
+  - **Contradictory external sources** — two external links on the same page cite different figures for the same claim without        
+  explaining the discrepancy                                                                                                          
+                                                                                                                                      
+  Report link findings under a **Links** section in the per-page report. List broken links first, then content issues. Omit the       
+  section entirely if no issues are found.                                                                                            
+                  
+  Repeat steps 1a–1c for every URL. Store all results before moving to analysis.                                                      
+                                          
+  ---                                                                                                                                 
+                                                                                                                                      
+  ## Step 2 — Identify Cannibalized Copy
+                                                                                                                                      
+  Cannibalized copy is content that appears across multiple pages in a way that causes them to compete with each other in search —
+  Google cannot determine which page to rank for a given query because the substance is the same. This is distinct from pages that
+  cover similar topics with genuinely different copy.
+                                                                                                                                      
+  Compare extracted text across all pages. Look for:
+                                                                                                                                      
+  - **Verbatim cannibalization** — sentences or paragraphs repeated word-for-word across pages; the most direct form and most damaging
+   to rankings                                                                                                                        
+  - **Near-duplicate cannibalization** — same substance, slightly reworded (e.g., same bullet list with minor edits, same section with
+   swapped synonyms); Google treats these as duplicate for ranking purposes                                                           
+  - **Template cannibalization** — identical section frameworks reused across pages (e.g., the same "Why Choose Us" block, the same
+  7-step legal process) where the copy is so similar that each page fails to establish a distinct topical identity                    
+                                                                                                                                      
+  For each instance found:
+  - Identify which pages are cannibalizing each other                                                                                 
+  - State the SEO risk: pages competing for the same query, diluted topical authority, or reduced crawl value
+  - Note whether the overlap is true cannibalization (identical substance) or superficial (similar topic, genuinely differentiated    
+  copy — not a problem)                       
+                                                                                                                                      
+  ---                                                                                                                                 
+                                                                                                                                      
+  ## Step 3 — Identify Issues                                                                                                         
+                                                                                                                                      
+  For each page, check for:                   
+                                          
+  ### Legal / Factual Errors
+  - Wrong statute numbers or wrong statute for the practice area                                                                      
+  - SOL answers that omit the minority tolling rule for injury cases involving minors
+  - "All partners" or "all attorneys" credential claims that may not apply universally                                                
+  - Unsourced statistics                      
+  - Exclusivity claims ("only firm in Pennsylvania…") that can't be verified                                                          
+                                                                                                                                      
+  ### Munley-Specific Flags                                                                                                           
+  - **Guarantee language**: "maximum compensation," "we will win," "ensure you receive," "guaranteed recovery"                        
+  - **Stale firm age**: check whether "65 years" or similar age references match the current year (firm founded 1959)                 
+  - **Attorney credential mismatches**: attorney credited on a page whose listed specialization doesn't match the practice area
+  - **Unlinked bio blocks**: attorney bio blocks that don't link to the attorney's individual page                                    
+  - **Duplicate bio blocks**: mid-page bio block identical to bottom bio block on the same page                                       
+  - **Missing MCARE references**: for birth injury pages, absence of 40 P.S. § 1303.101 et seq. and 40 P.S. § 1303.513                
+                                                                                                                                      
+  ### Structural Issues                                                                                                               
+  - Missing H1 or H1 appearing as a lower heading level                                                                               
+  - Sections present on some pages but absent on others without good reason                                                           
+  - Key information buried or absent                                                                                                  
+  - CTAs missing or misplaced                                                                                                         
+  - "Why Choose" / credential sections that don't differentiate the page from others in the silo                                      
+                                                                                                                                      
+  ### Copy Errors                                                                                                                     
+  - Grammar, spelling, punctuation mistakes                                                                                           
+  - Broken or incomplete sentences                                                                                                    
+  - Awkward phrasing or unclear modifier attachment
+  - Inconsistent terminology (e.g., "cesarean" vs "Cesarean" vs "C-section" used interchangeably)                                     
+  - Repetitive words or phrases within a short section                                                                                
+  - Vague language that weakens the firm's voice ("good lawyer," "help you")
+                                                                                                                                      
+  ---                                                                                                                                 
+                                                                                                                                      
+  ## Step 4 — Produce the Report                                                                                                      
+                  
+  Output directly in chat as structured markdown.                                                                                     
+                                          
+  ### Header
+                                                                                                                                      
+  ```
+  # Munley Law Silo Audit                                                                                                             
+  - **Date**: [today's date]                  
+  - **Parent page**: [URL]                
+  - **Supporting pages**: [count]
+  - **Pages analyzed**: [list]                                                                                                        
+  ```                                     
+                                                                                                                                      
+  ### Per-Page Results                                                                                                                
+   
+  Report on every page — parent and supporting — but apply different rules to each.                                                   
+                                          
+  #### Parent page
+                                                                                                                                      
+  The parent page is reported on for legal/factual errors, structural issues, copy errors, and Munley-specific flags. Do **not**
+  include a cannibalized copy section for the parent — it is the reference point for the silo, not a page being changed for           
+  cannibalization. If the parent itself contains content that supporting pages have duplicated, note those instances in each
+  supporting page's cannibalized copy section instead.                                                                                
+   
+  ---                                                                                                                                 
+                  
+  # [Parent Page Title] *(Parent)*            
+  [Full URL]                              
+                                              
+  **Legal/factual error:** *(only if one exists)*                                                                                     
+  - [Description, correct information, statute or source]
+                                                                                                                                      
+  **Structural issue:** *(only if one exists)*
+  - [Description]                                                                                                                     
+                                                                                                                                      
+  **Munley-specific flags:** *(only if any exist)*
+  - [Description]                                                                                                                     
+                                              
+  **Links:** *(only if issues exist)*     
+  - [Description — broken links first, then missing bio links, weak anchors, contradictory external sources]
+                                                                                                                                      
+  **Errors:** *(only if copy mistakes exist)*
+  - [Description]                                                                                                                     
+                                                                                                                                      
+  ---
+                                                                                                                                      
+  #### Supporting pages
+
+  Supporting pages are reported on in full, including cannibalized copy. When a supporting page duplicates content from the parent,
+  name the parent explicitly in the cannibalized copy section.
+
+  ---                                                                                                                                 
+   
+  # [Supporting Page Title]                                                                                                           
+  [Full URL]      
+
+  **Cannibalized copy:**
+  - [Topic] — cannibalizes [page name(s)]; [one sentence on the SEO risk]
+                                              
+  **Suggested replacements:**                 
+  - [Topic] → [specific replacement direction tailored to this page's audience and topic, explaining what unique angle this page
+  should own]                                                                                                                         
+                                                                                                                                      
+  **Legal/factual error:** *(only if one exists)*                                                                                     
+  - [Description, correct information, statute or source]                                                                             
+                  
+  **Structural issue:** *(only if one exists)*                                                                                        
+  - [Description]
+                                                                                                                                      
+  **Munley-specific flags:** *(only if any exist)*
+  - [Description]
+
+  **Links:** *(only if issues exist)*         
+  - [Description — broken links first, then missing bio links, weak anchors, contradictory external sources]
+
+  **Errors:** *(only if copy mistakes exist)*                                                                                         
+  - [Description]
+                                                                                                                                      
+  ---             
+
+  Then close with a **Silo-wide issues** section covering problems that affect all pages (e.g., absent statutes, inconsistent SOL
+  answers, duplicate bio blocks).         
+
+  ---                                                                                                                                 
+   
+  ## Step 5 — Update Patterns Log                                                                                                     
+                  
+  After delivering the report, update `/Users/nicko/.claude/skills/munley-silo-analyzer/PATTERNS.md`.
+                                          
+  The file has two sections:
+                                                                                                                                      
+  ### Section 1 — Silo Log
+  Append one entry per run:                                                                                                           
+                  
+  ```markdown
+  ## [Date] — [Practice Area] silo ([location if applicable])
+  - **Parent**: [URL]                         
+  - **Supporting pages**: [URLs, one per line]
+  - **Key findings**: [2–5 bullet points summarising the most significant issues found]
+  ```                                                                                                                                 
+                                          
+  ### Section 2 — Cross-Silo Patterns                                                                                                 
+  This section accumulates issues that recur across multiple silos. Use the following logic:                                          
+   
+  - **First time** an issue appears: add it under `### Emerging (seen once)` with the silo it came from                               
+  - **Second time** the same issue appears in a different silo: move it to `### Confirmed (seen in 2+ silos)` and mark it
+  `[CONFIRMED]`
+  - **Each subsequent time**: add the new silo to the confirmed entry's source list                                                   
+                                              
+  Pattern entries should follow this format:                                                                                          
+                  
+  ```markdown                                                                                                                         
+  #### [Short issue name]
+  **Type**: [Legal error / Copy error / Structural / Guarantee language / Credential claim / Template copy]                           
+  **Description**: [One sentence describing the issue precisely]
+  **Writing guidance**: [One sentence telling a writer how to avoid this issue going forward]
+  **Seen in**: [silo name(s) and date(s)]
+  **Status**: Emerging / [CONFIRMED]                                                                                                  
+  ```                                         
+                                                                                                                                      
+  When a pattern becomes `[CONFIRMED]`, note it to the user: "Pattern confirmed across silos: [short name] — added to cross-silo
+  patterns log."                                                                                                                      
+   
+  ---                                                                                                                                 
+                  
+  ## Rules
+
+  - **Parent page is included** in the output but only for legal errors, structural issues, Munley-specific flags, and copy errors —
+  never include a cannibalized copy section for the parent
+  - **Cannibalization is a supporting page problem** — when a supporting page duplicates parent content, flag it on the supporting
+  page; the parent is the reference, not the page being fixed                                                                         
+  - **Skip empty sections** — omit any section with nothing to report
+  - **Suggestions must be specific** — tailored to the page's audience and topic, not generic advice                                  
+  - **Citations required** — any legal or factual claim in findings must include a verifiable source                                  
+  - **Page names as H1 headings** — use `#` so page titles stand out
+  - **Horizontal rules between pages** — use `---` to separate sections                                                               
+  - **Score honestly** — do not soften findings; if guarantee language appears, flag it; if a stat is unsourced, flag it              
+  - **Patterns log is cumulative** — never overwrite existing entries; always append
